@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -41,6 +42,7 @@ MODE_PRO = "pro"
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 DB_POOL: asyncpg.Pool | None = None
+LAST_MEMBERSHIP_CHECK: dict[int, tuple[int, float]] = {}
 
 
 TEXT_PRIVATE_STUB = (
@@ -650,9 +652,10 @@ async def reset_to_registration(chat_id: int) -> dict[str, Any]:
     return session
 
 
-async def send_gate_post(chat_id: int, reset: bool = False) -> None:
+async def send_gate_post(chat_id: int, reset: bool = False, humans: int | None = None) -> None:
     await upsert_chat(chat_id)
-    humans = await actual_human_count(chat_id)
+    if humans is None:
+        humans = await actual_human_count(chat_id)
     has_pro = await group_has_pro(chat_id)
 
     if humans < 2:
@@ -676,6 +679,16 @@ async def send_gate_post(chat_id: int, reset: bool = False) -> None:
         round_text(session["round_number"], session["players"]),
         round_keyboard(session["mode"], session["round_number"], allow_clear=bool(session["last_photo_user_id"])),
     )
+
+
+async def react_to_membership_change(chat_id: int) -> None:
+    humans = await actual_human_count(chat_id)
+    previous = LAST_MEMBERSHIP_CHECK.get(chat_id)
+    current_time = time.monotonic()
+    if previous and previous[0] == humans and current_time - previous[1] < 3:
+        return
+    LAST_MEMBERSHIP_CHECK[chat_id] = (humans, current_time)
+    await send_gate_post(chat_id, reset=False, humans=humans)
 
 
 async def start_game(chat_id: int, user: types.User, requested_mode: str) -> None:
@@ -846,11 +859,8 @@ async def bot_added_to_group(event: types.ChatMemberUpdated) -> None:
 async def member_changed(event: types.ChatMemberUpdated) -> None:
     if event.chat.type not in {"group", "supergroup"}:
         return
-    if event.new_chat_member.status in {"member", "administrator", "creator"}:
-        humans = await actual_human_count(event.chat.id)
-        has_pro = await group_has_pro(event.chat.id)
-        if (not has_pro and humans >= 3) or (has_pro and humans >= 11):
-            await send_gate_post(event.chat.id, reset=False)
+    if event.old_chat_member.status != event.new_chat_member.status:
+        await react_to_membership_change(event.chat.id)
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}), Command("start", "play"))
@@ -859,6 +869,20 @@ async def start_or_play(message: types.Message) -> None:
     session = await reset_to_registration(message.chat.id)
     await save_session(message.chat.id, STATUS_REGISTRATION, session["mode"], 0, session["players"], None, None)
     await send_gate_post(message.chat.id, reset=True)
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.new_chat_members)
+async def new_group_members(message: types.Message) -> None:
+    if message.new_chat_members and any(member.is_bot for member in message.new_chat_members):
+        return
+    await react_to_membership_change(message.chat.id)
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.left_chat_member)
+async def group_member_left(message: types.Message) -> None:
+    if message.left_chat_member and message.left_chat_member.is_bot:
+        return
+    await react_to_membership_change(message.chat.id)
 
 
 @dp.callback_query(F.message.chat.type == "private")
@@ -934,7 +958,7 @@ async def clear_round(callback: types.CallbackQuery) -> None:
     await safe_callback_answer(callback)
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}) & F.photo)
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.photo)
 async def handle_photo(message: types.Message) -> None:
     if not message.from_user:
         return
