@@ -1029,6 +1029,14 @@ async def root() -> JSONResponse:
     return JSONResponse({"status": "working", "bot": "100_photo_bot"})
 
 
+@app.get("/health/db")
+async def database_health() -> JSONResponse:
+    pool = await get_db_pool()
+    async with pool.acquire() as conn:
+        await conn.fetchval("SELECT 1")
+    return JSONResponse({"status": "ok", "db": "connected"})
+
+
 @app.post(WEBHOOK_PATH)
 async def telegram_webhook(request: Request) -> Response:
     try:
